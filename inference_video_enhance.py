@@ -24,7 +24,7 @@ def cv2_vreader(video_path):
             ret, frame = cap.read()
             if not ret:
                 break
-            yield frame[:, :, ::-1]  # BGR -> RGB
+            yield frame[:, :, ::-1].copy()  # BGR -> RGB
     finally:
         cap.release()
 
