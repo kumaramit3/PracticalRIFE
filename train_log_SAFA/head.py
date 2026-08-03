@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from model.warplayer import *
+from train_log_SAFA.warplayer import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

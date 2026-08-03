@@ -4,9 +4,9 @@ import numpy as np
 from torch.optim import AdamW
 import torch.optim as optim
 import itertools
-from train_log.warplayer import warp
+from train_log_SAFA.warplayer import warp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from train_log.flownet import *
+from train_log_SAFA.flownet import *
 import torch.nn.functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

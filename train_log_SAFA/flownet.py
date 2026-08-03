@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from train_log.warplayer import warp
-from train_log.head import Head
+from train_log_SAFA.warplayer import warp
+from train_log_SAFA.head import Head
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
