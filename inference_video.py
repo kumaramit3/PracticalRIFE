@@ -99,7 +99,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.set_grad_enabled(False)
 if torch.cuda.is_available():
     torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
     if(args.fp16):
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
 
