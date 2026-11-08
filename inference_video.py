@@ -7,10 +7,13 @@ from tqdm import tqdm
 from torch.nn import functional as F
 import warnings
 import _thread
+import subprocess
+import threading
 from queue import Queue, Empty
 from model.pytorch_msssim import ssim_matlab
 
 warnings.filterwarnings("ignore")
+
 
 def cv2_vreader(video_path):
     """Frame generator that replaces skvideo.io.vreader (unmaintained,
@@ -27,6 +30,31 @@ def cv2_vreader(video_path):
             yield frame[:, :, ::-1].copy()
     finally:
         cap.release()
+
+
+def open_ffmpeg_writer(path, w, h, fps, codec, crf, preset):
+    """Start an ffmpeg process that reads raw RGB frames from stdin and
+    encodes them with the chosen codec (libx264, libx265, h264_nvenc, ...)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", "{}x{}".format(w, h),
+        "-r", str(fps),
+        "-i", "-",
+        # yuv420p needs even dimensions
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-c:v", codec,
+    ]
+    if "nvenc" in codec:
+        # NVENC uses -cq for constant quality and p1..p7 presets
+        cmd += ["-cq", str(crf), "-preset", preset if preset else "p5"]
+    else:
+        cmd += ["-crf", str(crf), "-preset", preset if preset else "slow"]
+    if codec in ("libx265", "hevc_nvenc"):
+        cmd += ["-tag:v", "hvc1"]  # better compatibility with Apple players
+    cmd += ["-pix_fmt", "yuv420p", path]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
 
 def transferAudio(sourceVideo, targetVideo):
     import shutil
@@ -46,14 +74,15 @@ def transferAudio(sourceVideo, targetVideo):
 
     targetNoAudio = os.path.splitext(targetVideo)[0] + "_noaudio" + os.path.splitext(targetVideo)[1]
     os.rename(targetVideo, targetNoAudio)
+
     # combine audio file and new video file
     os.system('ffmpeg -y -i "{}" -i {} -c copy "{}"'.format(targetNoAudio, tempAudioFileName, targetVideo))
 
-    if os.path.getsize(targetVideo) == 0: # if ffmpeg failed to merge the video and audio together try converting the audio to aac
+    if os.path.getsize(targetVideo) == 0:  # if ffmpeg failed to merge the video and audio together try converting the audio to aac
         tempAudioFileName = "./temp/audio.m4a"
         os.system('ffmpeg -y -i "{}" -c:a aac -b:a 160k -vn {}'.format(sourceVideo, tempAudioFileName))
         os.system('ffmpeg -y -i "{}" -i {} -c copy "{}"'.format(targetNoAudio, tempAudioFileName, targetVideo))
-        if (os.path.getsize(targetVideo) == 0): # if aac is not supported by selected format
+        if (os.path.getsize(targetVideo) == 0):  # if aac is not supported by selected format
             os.rename(targetNoAudio, targetVideo)
             print("Audio transfer failed. Interpolated video will have no audio")
         else:
@@ -66,6 +95,7 @@ def transferAudio(sourceVideo, targetVideo):
 
     # remove temp directory
     shutil.rmtree("temp")
+
 
 parser = argparse.ArgumentParser(description='Interpolation for a pair of images')
 parser.add_argument('--video', dest='video', type=str, default=None)
@@ -82,14 +112,16 @@ parser.add_argument('--png', dest='png', action='store_true', help='whether to v
 parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='vid_out video extension')
 parser.add_argument('--exp', dest='exp', type=int, default=1)
 parser.add_argument('--multi', dest='multi', type=int, default=2)
-
+parser.add_argument('--crf', dest='crf', type=int, default=16, help='quality for libx264/libx265 (lower = better, 18-23 for smaller files); used as -cq for NVENC')
+parser.add_argument('--codec', dest='codec', type=str, default='libx264', help='ffmpeg video codec: libx264, libx265, h264_nvenc, hevc_nvenc, ...')
+parser.add_argument('--preset', dest='preset', type=str, default=None, help='encoder preset (default: slow for x264/x265, p5 for NVENC)')
 args = parser.parse_args()
 if args.exp != 1:
     args.multi = (2 ** args.exp)
 assert (not args.video is None or not args.img is None)
 if args.skip:
     print("skip flag is abandoned, please refer to issue #207.")
-if args.UHD and args.scale==1.0:
+if args.UHD and args.scale == 1.0:
     args.scale = 0.5
 assert args.scale in [0.25, 0.5, 1.0, 2.0, 4.0]
 if not args.img is None:
@@ -124,7 +156,6 @@ if not args.video is None:
         fpsNotAssigned = False
     videogen = cv2_vreader(args.video)
     lastframe = next(videogen)
-    fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
     video_path_wo_ext, ext = os.path.splitext(args.video)
     print('{}.{}, {} frames in total, {}FPS to {}FPS'.format(video_path_wo_ext, args.ext, tot_frame, fps, args.fps))
     if args.png == False and fpsNotAssigned == True:
@@ -137,7 +168,7 @@ else:
         if 'png' in f:
             videogen.append(f)
     tot_frame = len(videogen)
-    videogen.sort(key= lambda x:int(x[:-4]))
+    videogen.sort(key=lambda x: int(x[:-4]))
     lastframe = cv2.imread(os.path.join(args.img, videogen[0]), cv2.IMREAD_UNCHANGED)[:, :, ::-1].copy()
     videogen = videogen[1:]
 h, w, _ = lastframe.shape
@@ -151,7 +182,8 @@ else:
         vid_out_name = args.output
     else:
         vid_out_name = '{}_{}X_{}fps.{}'.format(video_path_wo_ext, args.multi, int(np.round(args.fps)), args.ext)
-    vid_out = cv2.VideoWriter(vid_out_name, fourcc, args.fps, (w, h))
+    vid_out = open_ffmpeg_writer(vid_out_name, w, h, args.fps, args.codec, args.crf, args.preset)
+
 
 def clear_write_buffer(user_args, write_buffer):
     cnt = 0
@@ -163,7 +195,9 @@ def clear_write_buffer(user_args, write_buffer):
             cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt), item[:, :, ::-1])
             cnt += 1
         else:
-            vid_out.write(item[:, :, ::-1])
+            # frames are already RGB, ffmpeg reads rgb24 from stdin
+            vid_out.stdin.write(np.ascontiguousarray(item).tobytes())
+
 
 def build_read_buffer(user_args, read_buffer, videogen):
     try:
@@ -177,7 +211,8 @@ def build_read_buffer(user_args, read_buffer, videogen):
         pass
     read_buffer.put(None)
 
-def make_inference(I0, I1, n):    
+
+def make_inference(I0, I1, n):
     global model
     if model.version >= 3.9:
         res = []
@@ -190,16 +225,18 @@ def make_inference(I0, I1, n):
             return [middle]
         first_half = make_inference(I0, middle, n=n//2)
         second_half = make_inference(middle, I1, n=n//2)
-        if n%2:
+        if n % 2:
             return [*first_half, middle, *second_half]
         else:
             return [*first_half, *second_half]
+
 
 def pad_image(img):
     if(args.fp16):
         return F.pad(img, padding).half()
     else:
         return F.pad(img, padding)
+
 
 if args.montage:
     left = w // 4
@@ -214,11 +251,12 @@ if args.montage:
 write_buffer = Queue(maxsize=500)
 read_buffer = Queue(maxsize=500)
 _thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen))
-_thread.start_new_thread(clear_write_buffer, (args, write_buffer))
+writer_thread = threading.Thread(target=clear_write_buffer, args=(args, write_buffer))
+writer_thread.start()
 
-I1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+I1 = torch.from_numpy(np.transpose(lastframe, (2, 0, 1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
 I1 = pad_image(I1)
-temp = None # save lastframe when processing static frame
+temp = None  # save lastframe when processing static frame
 
 while True:
     if temp is not None:
@@ -229,7 +267,7 @@ while True:
     if frame is None:
         break
     I0 = I1
-    I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+    I1 = torch.from_numpy(np.transpose(frame, (2, 0, 1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
     I1 = pad_image(I1)
     I0_small = F.interpolate(I0, (32, 32), mode='bilinear', align_corners=False)
     I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
@@ -237,19 +275,19 @@ while True:
 
     break_flag = False
     if ssim > 0.996:
-        frame = read_buffer.get() # read a new frame
+        frame = read_buffer.get()  # read a new frame
         if frame is None:
             break_flag = True
             frame = lastframe
         else:
             temp = frame
-        I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+        I1 = torch.from_numpy(np.transpose(frame, (2, 0, 1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
         I1 = pad_image(I1)
         I1 = model.inference(I0, I1, scale=args.scale)
         I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
         ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
         frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
-        
+
     if ssim < 0.2:
         output = []
         for i in range(args.multi - 1):
@@ -287,12 +325,13 @@ else:
     write_buffer.put(lastframe)
 write_buffer.put(None)
 
-import time
-while(not write_buffer.empty()):
-    time.sleep(0.1)
+# wait for the writer thread to flush every queued frame
+writer_thread.join()
 pbar.close()
 if not vid_out is None:
-    vid_out.release()
+    # close ffmpeg's stdin so it can finalize the file, then wait for it
+    vid_out.stdin.close()
+    vid_out.wait()
 
 # move audio to new video file if appropriate
 if args.png == False and fpsNotAssigned == True and not args.video is None:
